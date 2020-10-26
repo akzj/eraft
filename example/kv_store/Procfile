@@ -1,0 +1,4 @@
+# Use goreman to run `go get github.com/mattn/goreman`
+node1: ./kv_store -c node1.json
+node2: ./kv_store -c node2.json
+node3: ./kv_store -c node3.json

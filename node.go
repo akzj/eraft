@@ -1,13 +1,19 @@
 package eraft
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"go.etcd.io/etcd/etcdserver/api/rafthttp"
 	"go.etcd.io/etcd/pkg/fileutil"
 	"go.etcd.io/etcd/pkg/types"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -34,6 +40,7 @@ type Node struct {
 	raftStorage     *raft.MemoryStorage
 	queue           *blockqueue.QueueWithContext
 	transport       *rafthttp.Transport
+	serv            *http.Server
 	isLeader        bool
 	readStatus      unsafe.Pointer //*raft.ReadState
 	committedIndex  uint64
@@ -41,11 +48,20 @@ type Node struct {
 	appliedIndex    uint64
 	snapIndex       uint64
 	pendingSnapshot bool
+	stopC           chan interface{}
+	isStop          int32
+	lead            uint64
 }
 
 type NodeMeta struct {
 	NodeID    uint64 `json:"node_id"`
 	ClusterID uint64 `json:"cluster_id"`
+}
+
+func (n NodeMeta) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
+	encoder.AddUint64("node_id", n.NodeID)
+	encoder.AddUint64("cluster_id", n.ClusterID)
+	return nil
 }
 
 func readWAL(lg *zap.Logger, waldir string, snap walpb.Snapshot) (
@@ -75,8 +91,7 @@ func readWAL(lg *zap.Logger, waldir string, snap walpb.Snapshot) (
 		}
 		break
 	}
-	var meta NodeMeta
-	if err := json.Unmarshal(metadata, &meta); err != nil {
+	if err := json.Unmarshal(metadata, &nodeMeta); err != nil {
 		panic(err)
 	}
 	return w, nodeMeta, st, entries
@@ -94,12 +109,14 @@ func StartNode(options Options) *Node {
 			)
 		}
 	}
-	membership := openMembership(options.Logger, options.MemberDir, options.ClusterName, options.MembersUrlMap)
+	membership := openMembership(options.Logger, options.MemberDir,
+		options.ClusterName, options.NodeName, options.MembersUrlMap)
 	raftStorage := raft.NewMemoryStorage()
 	snapshotter := snap.New(options.Logger, options.SnapDir)
 	var raftWal *wal.WAL
 	var raftNode raft.Node
 	if restart {
+		options.Logger.Info("wal exist")
 		var walsnap walpb.Snapshot
 		walSnaps, err := wal.ValidSnapshotEntries(options.Logger, options.WalDir)
 		if err != nil {
@@ -132,6 +149,10 @@ func StartNode(options Options) *Node {
 			}
 		}
 		w, nodeMeta, st, entries := readWAL(options.Logger, options.WalDir, walsnap)
+		if nodeMeta.ClusterID == 0 || nodeMeta.NodeID == 0 {
+			options.Logger.Fatal("nodeMeta error", zap.Object("nodeMeta", nodeMeta))
+		}
+		options.Logger.Info("wal entries", zap.Int("size", len(entries)))
 		if err := raftStorage.Append(entries); err != nil {
 			options.Logger.Fatal("raftStorage append entries failed", zap.Error(err))
 		}
@@ -153,10 +174,14 @@ func StartNode(options Options) *Node {
 		var err error
 		metadata, _ := json.Marshal(
 			&NodeMeta{
-				NodeID:    options.NodeID,
-				ClusterID: options.ClusterID,
+				NodeID:    membership.LocalID,
+				ClusterID: membership.ClusterID,
 			},
 		)
+		if err := fileutil.CreateDirAll(options.SnapDir); err != nil {
+			options.Logger.Fatal("create dir failed",
+				zap.String("dir", options.SnapDir), zap.Error(err))
+		}
 		if raftWal, err = wal.Create(options.Logger, options.WalDir, metadata); err != nil {
 			options.Logger.Panic("failed to create WAL", zap.Error(err))
 		}
@@ -164,6 +189,7 @@ func StartNode(options Options) *Node {
 		for _, member := range membership.GetMembers() {
 			ctx, _ := json.Marshal(member)
 			peers = append(peers, raft.Peer{ID: member.ID, Context: ctx})
+			options.Logger.Info("peer info", zap.Uint64("ID", member.ID))
 		}
 		member := membership.LocalMember()
 		options.Logger.Info(
@@ -171,22 +197,18 @@ func StartNode(options Options) *Node {
 			zap.String("local-member-id", member.Name),
 			zap.String("cluster-id", membership.GetClusterName()),
 		)
-		s := raft.NewMemoryStorage()
 		c := &raft.Config{
 			ID:              member.ID,
 			ElectionTick:    options.ElectionTick,
 			HeartbeatTick:   1,
-			Storage:         s,
+			Storage:         raftStorage,
 			MaxSizePerMsg:   options.MaxSizePerMsg,
 			MaxInflightMsgs: options.MaxInflightMsgs,
 			PreVote:         options.PreVote,
 			CheckQuorum:     true,
 		}
-		if len(peers) == 0 {
-			raftNode = raft.RestartNode(c)
-		} else {
-			raftNode = raft.StartNode(c, peers)
-		}
+		raftNode = raft.StartNode(c, peers)
+		//raftNode.Tick()
 	}
 
 	cb := new(transporterCB)
@@ -199,15 +221,29 @@ func StartNode(options Options) *Node {
 		membership:      membership,
 		queue:           blockqueue.NewQueueWithContext(context.Background(), options.QueueCap),
 		pendingSnapshot: false,
+		stopC:           make(chan interface{}),
+		raftStorage:     raftStorage,
 	}
+	cb.node = node
+
+	encoderCfg := zapcore.EncoderConfig{
+		MessageKey:     "msg",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		EncodeLevel:    zapcore.LowercaseLevelEncoder,
+		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		EncodeDuration: zapcore.StringDurationEncoder,
+	}
+	core := zapcore.NewCore(zapcore.NewJSONEncoder(encoderCfg), os.Stdout, zap.DebugLevel)
+	logger := zap.New(core).WithOptions()
 
 	node.transport = &rafthttp.Transport{
-		Logger:      zap.NewExample(),
-		ID:          types.ID(options.NodeID),
-		ClusterID:   types.ID(options.ClusterID),
+		Logger:      logger,
+		ID:          types.ID(membership.LocalID),
+		ClusterID:   types.ID(membership.ClusterID),
 		Raft:        cb,
-		ServerStats: stats.NewServerStats("", ""),
-		LeaderStats: stats.NewLeaderStats(strconv.FormatUint(options.NodeID, 10)),
+		ServerStats: stats.NewServerStats(membership.ClusterName, membership.LocalMember().Name),
+		LeaderStats: stats.NewLeaderStats(strconv.FormatUint(membership.LocalID, 10)),
 		ErrorC:      make(chan error),
 	}
 
@@ -215,12 +251,43 @@ func StartNode(options Options) *Node {
 		options.Logger.Fatal(err.Error())
 	}
 	for _, member := range membership.GetMembers() {
-		if member.ID == options.NodeID {
+		if member.ID == membership.LocalID {
 			continue
 		}
 		node.transport.AddPeer(types.ID(member.ID), member.URLs)
 	}
 
+	serv := &http.Server{
+		Handler: node.transport.Handler(),
+	}
+	node.serv = serv
+	url, err := url.Parse(membership.LocalMember().URLs[0])
+	if err != nil {
+		options.Logger.Fatal("parse url failed",
+			zap.String("url", membership.LocalMember().URLs[0]), zap.Error(err))
+	}
+	l, err := net.Listen("tcp", net.JoinHostPort(options.Host, url.Port()))
+	if err != nil {
+		options.Logger.Fatal("listen failed",
+			zap.Strings("url", membership.LocalMember().URLs), zap.Error(err))
+	}
+	options.Logger.Info("-----------node listen success----------",
+		zap.String("addr", net.JoinHostPort(options.Host, url.Port())),
+		zap.String("name", membership.NodeName))
+	go func() {
+		if err := serv.Serve(l); err != nil {
+			if err != http.ErrServerClosed {
+				options.Logger.Fatal("http serve failed", zap.Error(err))
+			}
+		}
+	}()
+
+	go func() {
+		if err := node.loop(); err != nil {
+			node.Logger.Error("node error stop", zap.Error(err))
+			_ = node.Close()
+		}
+	}()
 	return node
 }
 
@@ -256,22 +323,24 @@ func (node *Node) ErrorC() chan error {
 	return node.transport.ErrorC
 }
 
-func (node *Node) Loop() error {
-	var rd raft.Ready
-	tick := time.NewTicker(node.TickInterval)
+func (node *Node) loop() error {
+	tick := time.NewTicker(node.Options.TickMs)
 	defer func() {
 		tick.Stop()
 	}()
 	for {
 		select {
-		case rd = <-node.node.Ready():
+		case <-tick.C:
+			node.node.Tick()
+		case rd := <-node.node.Ready():
 			if err := node.handleReady(&rd); err != nil {
 				return err
 			}
 			node.node.Advance()
-		case <-tick.C:
-			node.node.Tick()
-			continue
+		case <-node.stopC:
+			node.Logger.Warn("node quit",
+				zap.String("nodeID", node.membership.LocalMember().Name))
+			return nil
 		}
 	}
 }
@@ -304,9 +373,11 @@ func createApplyDone() (ApplyDone, <-chan interface{}) {
 }
 
 func (node *Node) applyEntries(entries []raftpb.Entry) error {
+	node.Logger.Info("applyEntries", zap.Int("size", len(entries)))
 	applyEntries := make([]ApplyEntry, 0, len(entries))
 	pushEntries := func() error {
 		if len(applyEntries) != 0 {
+			node.Logger.Info("pushEntries", zap.Int("size", len(applyEntries)))
 			if err := node.queue.Push(applyEntries); err != nil {
 				return errors.WithStack(err)
 			}
@@ -316,7 +387,14 @@ func (node *Node) applyEntries(entries []raftpb.Entry) error {
 	}
 	for i := range entries {
 		entry := &entries[i]
+		//node.Logger.Info("entryType",
+		//zap.String("type", entry.Type.String()), zap.String("data", string(entry.Data)))
 		switch entry.Type {
+		case raftpb.EntryConfChangeV2:
+			data, _ := json.Marshal(entry)
+			var buf bytes.Buffer
+			json.Indent(&buf, data, "", "    ")
+			node.Logger.Fatal("handle error", zap.String("entry", buf.String()))
 		case raftpb.EntryConfChange:
 			if err := pushEntries(); err != nil {
 				return err
@@ -336,6 +414,9 @@ func (node *Node) applyEntries(entries []raftpb.Entry) error {
 				return err
 			}
 		case raftpb.EntryNormal:
+			if len(entry.Data) == 0 {
+				continue
+			}
 			applyEntries = append(applyEntries, ApplyEntry{
 				Index: entry.Index,
 				Data:  entry.Data,
@@ -380,6 +461,17 @@ func (node *Node) createSnapshot(index uint64, sc raftpb.ConfState, data []byte)
 }
 
 func (node *Node) handleReady(rd *raft.Ready) error {
+	//node.Logger.Info("handle Ready")
+	if rd.SoftState != nil && rd.SoftState.Lead != 0 {
+		if node.lead != rd.SoftState.Lead {
+			node.lead = rd.SoftState.Lead
+			if node.membership.LocalID == node.lead {
+				node.isLeader = true
+			} else {
+				node.isLeader = false
+			}
+		}
+	}
 	if raft.IsEmptySnap(rd.Snapshot) == false {
 		if err := node.saveSnapshot(rd.Snapshot); err != nil {
 			return err
@@ -434,14 +526,18 @@ func (node *Node) filterMessage(ms []raftpb.Message) {
 }
 
 func (node *Node) handleConfChange(cc raftpb.ConfChange) error {
+	node.Logger.Info("handleConfChange", zap.String("type", cc.Type.String()), zap.String("context", string(cc.Context)))
 	node.confState = *node.node.ApplyConfChange(cc)
 	switch cc.Type {
 	case raftpb.ConfChangeAddNode, raftpb.ConfChangeAddLearnerNode:
-		var confChangeContext ConfChangeContext
-		if err := json.Unmarshal(cc.Context, &confChangeContext); err != nil {
-			return errors.WithStack(err)
+		if len(cc.Context) > 0 {
+			var member Member
+			if err := json.Unmarshal(cc.Context, &member); err != nil {
+				node.Logger.Fatal(err.Error())
+			}
+			//node.transport.AddPeer(types.ID(cc.ID), member.URLs)
+			node.Logger.Info("member info", zap.Object("member", member))
 		}
-		//todo
 	}
 	return nil
 }
@@ -450,11 +546,21 @@ func (node *Node) sendMessage(messages []raftpb.Message) error {
 	if len(messages) == 0 {
 		return nil
 	}
+	/*for _, message := range messages {
+		node.Logger.Info("sendMessage",
+			zap.String("node", node.membership.GetMember(message.To).Name),
+			zap.Uint64("nodeID", message.To))
+	}*/
+	node.Logger.Info("sendmessage", zap.Int("size", len(messages)))
 	node.transport.Send(messages)
 	return nil
 }
 
 func (node *Node) saveEntryWithState(entries []raftpb.Entry, state raftpb.HardState) error {
+	if len(entries) == 0 && raft.IsEmptyHardState(state) {
+		return nil
+	}
+	node.Logger.Info("saveEntry", zap.Int("size", len(entries)))
 	if err := node.wal.Save(state, entries); err != nil {
 		return errors.WithStack(err)
 	}
@@ -490,6 +596,7 @@ func (node *Node) releaseToSnapshot(snapshot raftpb.Snapshot) error {
 }
 
 func (node *Node) setCommittedIndex(index uint64) {
+	//node.Logger.Info("setCommittedIndex", zap.Uint64("index", index))
 	atomic.StoreUint64(&node.committedIndex, index)
 }
 
@@ -502,6 +609,7 @@ func (node *Node) isIDRemoved(to uint64) bool {
 }
 
 func (node *Node) triggerSnapshot(index uint64) error {
+	node.Logger.Info("triggerSnapshot", zap.Uint64("index", index))
 	cs := node.confState
 	if err := node.queue.Push(CreateSnapshot{func(Data []byte) error {
 		if err := node.createSnapshot(index, cs, Data); err != nil {
@@ -537,4 +645,13 @@ func (node *Node) reportUnreachable(id uint64) {
 
 func (node *Node) reportSnapshot(id uint64, status raft.SnapshotStatus) {
 	node.node.ReportSnapshot(id, status)
+}
+
+func (node *Node) Close() error {
+	if atomic.CompareAndSwapInt32(&node.isStop, 0, 1) == false {
+		return nil
+	}
+	node.node.Stop()
+	close(node.stopC)
+	return node.serv.Close()
 }
