@@ -169,14 +169,27 @@ func (s *Serv) Serve() {
 	})
 
 	s.engine.GET("/set/:key/:value", func(c *gin.Context) {
-		var req SetReq
-		req.Key = c.Param("key")
-		req.Value = c.Param("value")
-		req.ID = s.getID()
-		data, _ := json.Marshal(req)
-		if err := s.node.Propose(c.Request.Context(), data); err != nil {
-			c.String(http.StatusInternalServerError, err.Error())
-			return
+		var count uint64
+		go func() {
+			for {
+				var req SetReq
+				req.Key = c.Param("key")
+				req.Value = c.Param("value")
+				req.ID = s.getID()
+				data, _ := json.Marshal(req)
+				if err := s.node.Propose(c.Request.Context(), data); err != nil {
+					c.String(http.StatusInternalServerError, err.Error())
+					return
+				}
+				atomic.AddUint64(&count, 1)
+			}
+		}()
+		var lastCount uint64
+		for {
+			time.Sleep(time.Second)
+			tmp := atomic.LoadUint64(&count)
+			fmt.Println(tmp - lastCount)
+			lastCount = tmp
 		}
 	})
 	if err := s.engine.Run("127.0.0.1:" + strconv.Itoa(s.config.Port)); err != nil {

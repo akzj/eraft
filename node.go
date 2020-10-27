@@ -3,18 +3,16 @@ package eraft
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
-	"go.etcd.io/etcd/etcdserver/api/rafthttp"
+	"github.com/azkj/eraft/transport"
 	"go.etcd.io/etcd/pkg/fileutil"
-	"go.etcd.io/etcd/pkg/types"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,7 +21,6 @@ import (
 	"github.com/akzj/block-queue"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/etcdserver/api/snap"
-	stats "go.etcd.io/etcd/etcdserver/api/v2stats"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 	"go.etcd.io/etcd/wal"
@@ -32,14 +29,17 @@ import (
 
 type Node struct {
 	Options
-	membership      *Membership
-	confState       raftpb.ConfState
-	node            raft.Node
-	wal             *wal.WAL
-	snapshotter     *snap.Snapshotter
-	raftStorage     *raft.MemoryStorage
-	queue           *blockqueue.QueueWithContext
-	transport       *rafthttp.Transport
+	membership   *Membership
+	confState    raftpb.ConfState
+	node         raft.Node
+	wal          *wal.WAL
+	snapshotter  *snap.Snapshotter
+	raftStorage  *raft.MemoryStorage
+	queue        *blockqueue.QueueWithContext
+	proposeQueue *blockqueue.QueueWithContext
+
+	//transport       *rafthttp.Transport
+	transport       *transport.Transport
 	serv            *http.Server
 	isLeader        bool
 	readStatus      unsafe.Pointer //*raft.ReadState
@@ -223,6 +223,7 @@ func StartNode(options Options) *Node {
 		pendingSnapshot: false,
 		stopC:           make(chan interface{}),
 		raftStorage:     raftStorage,
+		proposeQueue:    blockqueue.NewQueueWithContext(context.Background(), 64),
 	}
 	cb.node = node
 
@@ -237,7 +238,7 @@ func StartNode(options Options) *Node {
 	core := zapcore.NewCore(zapcore.NewJSONEncoder(encoderCfg), os.Stdout, zap.DebugLevel)
 	logger := zap.New(core).WithOptions()
 
-	node.transport = &rafthttp.Transport{
+	/*node.transport = &rafthttp.Transport{
 		Logger:      logger,
 		ID:          types.ID(membership.LocalID),
 		ClusterID:   types.ID(membership.ClusterID),
@@ -245,19 +246,35 @@ func StartNode(options Options) *Node {
 		ServerStats: stats.NewServerStats(membership.ClusterName, membership.LocalMember().Name),
 		LeaderStats: stats.NewLeaderStats(strconv.FormatUint(membership.LocalID, 10)),
 		ErrorC:      make(chan error),
-	}
+	}*/
 
-	if err := node.transport.Start(); err != nil {
-		options.Logger.Fatal(err.Error())
+	transportOptions := transport.DefaultOptions()
+	transportOptions.Logger = logger
+	transportOptions.ClusterID = membership.ClusterID
+	transportOptions.Raft = cb
+
+	_, port, err := net.SplitHostPort(membership.LocalMember().Addrs[0])
+	if err != nil {
+		options.Logger.Fatal("parse url failed",
+			zap.String("addr", membership.LocalMember().Addrs[0]), zap.Error(err))
 	}
+	transportOptions.Port = port
+
+	node.transport = transport.NewTransport(transportOptions)
+
+	go func() {
+		if err := node.transport.Run(); err != nil {
+			options.Logger.Fatal(err.Error())
+		}
+	}()
 	for _, member := range membership.GetMembers() {
 		if member.ID == membership.LocalID {
 			continue
 		}
-		node.transport.AddPeer(types.ID(member.ID), member.URLs)
+		node.transport.AddPeer(member.ID, member.Addrs)
 	}
 
-	serv := &http.Server{
+	/*serv := &http.Server{
 		Handler: node.transport.Handler(),
 	}
 	node.serv = serv
@@ -281,11 +298,16 @@ func StartNode(options Options) *Node {
 			}
 		}
 	}()
-
+	*/
 	go func() {
 		if err := node.loop(); err != nil {
 			node.Logger.Error("node error stop", zap.Error(err))
 			_ = node.Close()
+		}
+	}()
+	go func() {
+		for i := 0; i < 1; i++ {
+			node.proposeLoop()
 		}
 	}()
 	return node
@@ -318,9 +340,23 @@ type HijackSnapshot struct {
 func (node *Node) Queue() *blockqueue.QueueWithContext {
 	return node.queue
 }
-
-func (node *Node) ErrorC() chan error {
-	return node.transport.ErrorC
+func (node *Node) proposeLoop() {
+	for {
+		items, _ := node.proposeQueue.PopAll(nil)
+		var buffer = bytes.NewBuffer(make([]byte, 0, 64*1024))
+		var count int
+		for _, it := range items {
+			count += 1
+			data := it.([]byte)
+			_ = binary.Write(buffer, binary.BigEndian, uint32(len(data)))
+			buffer.Write(data)
+		}
+		//node.Logger.Info("propose", zap.Int("count", count))
+		if err := node.node.Propose(context.Background(), buffer.Bytes()); err != nil {
+			node.Logger.Error("propose failed", zap.Error(err))
+		}
+		//time.Sleep(time.Millisecond * 10)
+	}
 }
 
 func (node *Node) loop() error {
@@ -373,11 +409,11 @@ func createApplyDone() (ApplyDone, <-chan interface{}) {
 }
 
 func (node *Node) applyEntries(entries []raftpb.Entry) error {
-	node.Logger.Info("applyEntries", zap.Int("size", len(entries)))
+	//node.Logger.Info("applyEntries", zap.Int("size", len(entries)))
 	applyEntries := make([]ApplyEntry, 0, len(entries))
 	pushEntries := func() error {
 		if len(applyEntries) != 0 {
-			node.Logger.Info("pushEntries", zap.Int("size", len(applyEntries)))
+			//node.Logger.Info("pushEntries", zap.Int("size", len(applyEntries)))
 			if err := node.queue.Push(applyEntries); err != nil {
 				return errors.WithStack(err)
 			}
@@ -417,10 +453,24 @@ func (node *Node) applyEntries(entries []raftpb.Entry) error {
 			if len(entry.Data) == 0 {
 				continue
 			}
-			applyEntries = append(applyEntries, ApplyEntry{
-				Index: entry.Index,
-				Data:  entry.Data,
-			})
+			var reader = bytes.NewReader(entry.Data)
+			for {
+				var size uint32
+				if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
+					if err == io.EOF {
+						break
+					}
+				}
+				data := make([]byte, size)
+				_, err := io.ReadFull(reader, data)
+				if err != nil {
+					node.Logger.Panic("encode entry failed", zap.Error(err))
+				}
+				applyEntries = append(applyEntries, ApplyEntry{
+					Index: entry.Index,
+					Data:  data,
+				})
+			}
 			node.setCommittedIndex(entry.Index)
 		}
 	}
@@ -551,8 +601,8 @@ func (node *Node) sendMessage(messages []raftpb.Message) error {
 			zap.String("node", node.membership.GetMember(message.To).Name),
 			zap.Uint64("nodeID", message.To))
 	}*/
-	node.Logger.Info("sendmessage", zap.Int("size", len(messages)))
-	node.transport.Send(messages)
+	//node.Logger.Info("sendmessage", zap.Int("size", len(messages)))
+	node.transport.SendMessages(messages)
 	return nil
 }
 
@@ -560,10 +610,10 @@ func (node *Node) saveEntryWithState(entries []raftpb.Entry, state raftpb.HardSt
 	if len(entries) == 0 && raft.IsEmptyHardState(state) {
 		return nil
 	}
-	node.Logger.Info("saveEntry", zap.Int("size", len(entries)))
-	if err := node.wal.Save(state, entries); err != nil {
+	//node.Logger.Info("saveEntry", zap.Int("size", len(entries)))
+	/*if err := node.wal.Save(state, entries); err != nil {
 		return errors.WithStack(err)
-	}
+	}*/
 	if err := node.raftStorage.Append(entries); err != nil {
 		return errors.WithStack(err)
 	}
@@ -632,7 +682,7 @@ func (node *Node) checkTriggerSnapshot() bool {
 }
 
 func (node *Node) Propose(ctx context.Context, data []byte) error {
-	return node.node.Propose(ctx, data)
+	return node.proposeQueue.Push(data)
 }
 
 func (node *Node) process(ctx context.Context, m raftpb.Message) error {

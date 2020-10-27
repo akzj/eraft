@@ -15,15 +15,15 @@ import (
 )
 
 type Member struct {
-	ID   uint64   `json:"id"`
-	Name string   `json:"name"`
-	URLs []string `json:"urls"`
+	ID    uint64   `json:"id"`
+	Name  string   `json:"name"`
+	Addrs []string `json:"addrs"`
 }
 
 func (m Member) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	encoder.AddUint64("id", m.ID)
 	encoder.AddString("name", m.Name)
-	encoder.AddString("urls", "["+strings.Join(m.URLs, "|")+"]")
+	encoder.AddString("urls", "["+strings.Join(m.Addrs, "|")+"]")
 	return nil
 }
 
@@ -68,11 +68,11 @@ func openMembership(logger *zap.Logger, dir string, clusterName string, nodeName
 		return &membership
 	}
 
-	for key, urls := range membersUrlsMap {
+	for key, addrs := range membersUrlsMap {
 		member := &Member{
-			ID:   0,
-			Name: key,
-			URLs: urls,
+			ID:    0,
+			Name:  key,
+			Addrs: addrs,
 		}
 		data, _ := json.Marshal(member)
 		member.ID = crc64.Checksum(data, crc64.MakeTable(crc64.ISO))
@@ -115,8 +115,8 @@ func (m *Membership) GetMembers() []Member {
 	var members []Member
 	for _, member := range m.Members {
 		members = append(members, Member{
-			ID:   member.ID,
-			URLs: append([]string{}, member.URLs...),
+			ID:    member.ID,
+			Addrs: append([]string{}, member.Addrs...),
 		})
 	}
 	return members

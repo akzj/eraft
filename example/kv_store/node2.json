@@ -1,17 +1,17 @@
 {
-    "path": "data",
-    "port": 6000,
-    "cluster_name": "cluster1",
-    "node_name": "node2",
-    "member_urls_map": {
-        "node1": [
-            "http://127.0.0.1:5001"
-        ],
-        "node2": [
-            "http://127.0.0.1:6001"
-        ],
-        "node3": [
-            "http://127.0.0.1:7001"
-        ]
-    }
+  "path": "data",
+  "port": 6000,
+  "cluster_name": "cluster1",
+  "node_name": "node2",
+  "member_urls_map": {
+    "node1": [
+      "127.0.0.1:5001"
+    ],
+    "node2": [
+      "127.0.0.1:6001"
+    ],
+    "node3": [
+      "127.0.0.1:7001"
+    ]
+  }
 }
